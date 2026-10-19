@@ -176,10 +176,59 @@ const api = async (
   if (!res.ok) throw new Error((await res.text()).slice(0, 300));
   return res.json();
 };
+// A plain <img src="/api/..."> never sends the Authorization header, so once API_TOKEN is
+// set every screenshot would 401. Fetch it with the header instead and render the blob —
+// same approach the evidence-download button already uses.
+function AuthImage({
+  src,
+  alt,
+  token,
+}: {
+  src: string;
+  alt: string;
+  token: string;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    fetch(src, { headers: token ? { Authorization: "Bearer " + token } : {} })
+      .then((r) => (r.ok ? r.blob() : Promise.reject(new Error("load failed"))))
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src, token]);
+  if (!url) return <div className="shot-loading" aria-label={alt} />;
+  return (
+    <img
+      src={url}
+      alt={alt}
+      onClick={() => window.open(url, "_blank")}
+      style={{ cursor: "zoom-in" }}
+    />
+  );
+}
 function UI() {
   const [groups, setGroups] = useState<Group[]>([]),
     [questions, setQuestions] = useState<Question[]>([]);
-  const [token, setToken] = useState(localStorage.getItem("fp_token") || "");
+  // sessionStorage rather than localStorage: this token unlocks the whole API, so it's
+  // worth not having it persist indefinitely across browser restarts. This is a partial
+  // mitigation, not a fix — any script able to run on this origin can still read it; a
+  // real fix is an HttpOnly session cookie, which would need a backend session endpoint.
+  const [token, setToken] = useState(() => {
+    try {
+      return sessionStorage.getItem("fp_token") || "";
+    } catch {
+      return "";
+    }
+  });
   const [apps, setApps] = useState<App[]>([]),
     [features, setFeatures] = useState<Feature[]>([]),
     [releases, setReleases] = useState<Release[]>([]),
@@ -198,6 +247,7 @@ function UI() {
     [featureId, setFeatureId] = useState(0),
     [reporter, setReporter] = useState(""),
     [assignee, setAssignee] = useState(""),
+    [assigneeTouched, setAssigneeTouched] = useState(false),
     [severity, setSeverity] = useState("Medium"),
     [pin, setPin] = useState(true),
     [attachments, setAttachments] = useState<File[]>([]);
@@ -288,13 +338,15 @@ function UI() {
     if (page === "Tests" && !editingTest && !tFeature && featureId)
       setTFeature(featureId);
   }, [page, featureId]);
-  // Auto-assign new feedback to the feature's reviewer, visibly — the field
-  // fills in so the reporter can see and still override it, not a silent default.
+  // Auto-assign new feedback to the feature's reviewer, visibly — the field fills in so
+  // the reporter can see and still override it, not a silent default. Re-derives whenever
+  // the selected feature changes, unless the reporter has typed something themselves —
+  // otherwise switching from feature A to feature B kept showing A's reviewer.
   useEffect(() => {
-    if (page !== "New feedback" || !featureId || assignee) return;
+    if (page !== "New feedback" || !featureId || assigneeTouched) return;
     const reviewer = features.find((f) => f.id === featureId)?.reviewer;
-    if (reviewer) setAssignee(reviewer);
-  }, [page, featureId, features]);
+    setAssignee(reviewer || "");
+  }, [page, featureId, features, assigneeTouched]);
   const availableFeatures = features.filter(
       (f) => !appId || f.application_id === appId,
     ),
@@ -348,6 +400,15 @@ function UI() {
         /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`,
       );
       if (!/^https?:$/.test(parsed.protocol)) throw new Error();
+      if (parsed.origin === window.location.origin) {
+        // The preview iframe's sandbox combines allow-scripts with allow-same-origin
+        // (needed so previewed apps keep working), which a same-origin page could use to
+        // strip its own sandbox and reach this app's own window — so it's never allowed.
+        setError(
+          "Can't preview this app's own origin in the browser panel (sandbox restriction).",
+        );
+        return;
+      }
       setBrowserUrl(parsed.href);
       setPreviewUrl(parsed.href);
       setError("");
@@ -458,6 +519,9 @@ function UI() {
       setBrowserUrl("");
       setPreviewUrl("");
       setAttachments([]);
+      setReporter("");
+      setAssignee("");
+      setAssigneeTouched(false);
       setPage("Feedback");
     });
   const updStep = (i: number, patch: Partial<Step>) =>
@@ -1173,7 +1237,10 @@ function UI() {
                 Assigned engineer
                 <input
                   value={assignee}
-                  onChange={(e) => setAssignee(e.target.value)}
+                  onChange={(e) => {
+                    setAssignee(e.target.value);
+                    setAssigneeTouched(true);
+                  }}
                 />
               </label>
             </div>
@@ -1694,17 +1761,12 @@ function UI() {
                                 )}
                                 <div className="shots">
                                   {run.screenshots.map((n) => (
-                                    <a
+                                    <AuthImage
                                       key={n}
-                                      href={`/api/test-runs/${run.id}/artifact/${n}`}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                    >
-                                      <img
-                                        src={`/api/test-runs/${run.id}/artifact/${n}`}
-                                        alt={n}
-                                      />
-                                    </a>
+                                      src={`/api/test-runs/${run.id}/artifact/${n}`}
+                                      alt={n}
+                                      token={token}
+                                    />
                                   ))}
                                 </div>
                               </div>
@@ -2004,7 +2066,12 @@ function UI() {
               value={token}
               onChange={(e) => {
                 setToken(e.target.value);
-                localStorage.setItem("fp_token", e.target.value);
+                try {
+                  sessionStorage.setItem("fp_token", e.target.value);
+                } catch {
+                  // ignore — e.g. a private window that blocks storage; the token still
+                  // works for this tab's lifetime via React state
+                }
               }}
             />
           </section>

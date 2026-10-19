@@ -183,26 +183,54 @@ counts — enough to judge release readiness at a glance.
 
 ## Known limitations
 
-This is a local-first prototype. Before pointing it at a real company
-network with multiple teams, be aware of:
+This is a local-first, single-tenant tool. A security and tech-debt pass
+(two independent reviews, one of them an Opus-model audit) fixed a
+substantial list of real issues — auth defaulting to open, the test
+runner being able to read local files and inherit backend secrets, SSRF
+via Git repo scanning and symlinks, network-layer egress enforcement that
+only checked the page URL afterward instead of blocking at the request
+level, upload content spoofing, an assignee auto-fill bug, screenshots
+that silently broke once auth was turned on, and more — all verified
+against the running app, not just reasoned about. What's still open,
+before pointing this at a real company network with multiple teams:
 
-- **No per-user auth or RBAC.** A single shared `API_TOKEN` (if set) gates
-  the whole API. There's no way to scope one team's applications away from
-  another's, and no audit trail of who did what.
+- **No per-user auth or RBAC.** `API_TOKEN` is required now, but it's
+  still one shared token for the whole API — no per-user identity, role,
+  or audit trail of who did what.
 - **No secrets management for test credentials.** Login steps in an
   authored test (`fill #password = ...`) store the value as plain text in
-  the database.
+  the database (though the runner process that reads it back no longer
+  inherits unrelated backend secrets).
 - **Single SQLite file by default.** No tenancy isolation; everything
   shares one database unless you switch to Postgres yourself and still
-  manage isolation at the infrastructure level.
-- **Synchronous test runs.** A run blocks its HTTP request for as long as
-  the browser takes; there's no job queue or per-team concurrency limit.
+  manage isolation at the infrastructure level. Postgres deployments also
+  don't get the SQLite-only column migrations — an existing Postgres DB
+  predating a given column needs a manual `ALTER TABLE` or a reset.
+- **Synchronous test runs**, bounded only by the new `MAX_CONCURRENT_*`
+  semaphores — still no real job queue or per-team fairness.
 - **Feedback questions have no answer-recording endpoint.** Questions can
   be defined per feature, but there's no API to record a response to one
   yet.
 - **Private Git repository auth isn't stored.** Discovery scanning works
   against public HTTPS repos, or ones your server can already reach
-  without extra credentials.
-- **JIRA integration has no connection-test button yet** — the first real
-  signal that credentials are wrong is the first failed ticket-creation
-  attempt, which does surface JIRA's actual error message.
+  without extra credentials, and is now blocked from targeting
+  internal/private/loopback addresses.
+- **The API token lives in `sessionStorage`**, an improvement over
+  `localStorage` but still not as safe as an HttpOnly session cookie,
+  which would need a backend session endpoint this doesn't have.
+- **Two very large single files** (`backend/app/main.py`,
+  `frontend/src/main.tsx`) — functional, but a real maintainability cost;
+  splitting them into modules wasn't attempted in this pass, to avoid
+  rewriting a large surface without being able to re-verify all of it.
+- **No response models, no pagination, some N+1 query patterns** on list
+  endpoints — fine at this app's current scale, a real cost at a much
+  larger one.
+- **No Alembic or other migration tool** — schema changes are hand-written
+  `ALTER TABLE` statements for SQLite only (see above).
+- **Docker/compose changes are unverified in this environment** — written
+  to known-good patterns (non-root users, `npm ci` with the lockfile,
+  Chromium installed so UI tests actually run in a container, security
+  headers, capability dropping where it could be confirmed safe) but no
+  Docker daemon was available to run a live `docker build`/`compose up`
+  here. Smoke-test before relying on it, especially a UI test run inside
+  the container.

@@ -1,14 +1,15 @@
-import os, uuid, shutil, secrets, subprocess, tempfile, re, json, base64, urllib.request, urllib.error
+import os, uuid, shutil, secrets, subprocess, tempfile, re, json, base64, urllib.request, urllib.error, threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 from urllib.parse import urlparse
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, ForeignKey, String, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DATABASE_URL=os.getenv('DATABASE_URL','sqlite:///./featurepulse.db')
 engine=create_engine(DATABASE_URL, connect_args={'check_same_thread':False} if DATABASE_URL.startswith('sqlite') else {}, pool_pre_ping=True)
@@ -16,14 +17,27 @@ SessionLocal=sessionmaker(bind=engine)
 STORAGE=Path(os.getenv('STORAGE_DIR','./uploads')); STORAGE.mkdir(parents=True,exist_ok=True)
 MAX_UPLOAD=50*1024*1024
 TOKEN=os.getenv('API_TOKEN','')
+ALLOW_NO_AUTH=os.getenv('FP_ALLOW_NO_AUTH','')=='1'
+if not TOKEN and not ALLOW_NO_AUTH:
+    raise RuntimeError(
+        "API_TOKEN must be set — it guards every endpoint, including ones that drive a "
+        "headless browser to arbitrary URLs, clone git repositories and create JIRA "
+        "tickets. For local-only development, opt out explicitly with FP_ALLOW_NO_AUTH=1; "
+        "never set that for anything reachable beyond your own machine."
+    )
+ENABLE_DOCS=os.getenv('FP_ENABLE_DOCS','')=='1'
 # Egress allowlist for UI tests: comma-separated hostname patterns, e.g. "internal.corp,*.internal.corp,localhost".
 # Empty (default) = unrestricted, so local/dev use needs no configuration.
 ALLOWED_TEST_HOSTS=[h.strip().lower() for h in os.getenv('ALLOWED_TEST_HOSTS','').split(',') if h.strip()]
 def host_allowed(url:str)->bool:
-    if not ALLOWED_TEST_HOSTS:return True
-    try:host=(urlparse(url).hostname or '').lower()
+    try:parsed=urlparse(url)
     except Exception:return False
+    # http(s) only, always — regardless of the allowlist — so a test step can never reach
+    # file://, data:, chrome:// or similar local-resource schemes via the headless browser.
+    if parsed.scheme not in ('http','https'):return False
+    host=(parsed.hostname or '').lower()
     if not host:return False
+    if not ALLOWED_TEST_HOSTS:return True
     for pat in ALLOWED_TEST_HOSTS:
         if pat.startswith('*.'):
             if host==pat[2:] or host.endswith(pat[1:]):return True
@@ -171,13 +185,19 @@ JIRA_API_TOKEN=os.getenv('JIRA_API_TOKEN','')
 JIRA_ISSUE_TYPE=os.getenv('JIRA_ISSUE_TYPE','Bug')
 JIRA_API_VERSION=os.getenv('JIRA_API_VERSION','3')  # '3' = Jira Cloud (rich-text description), '2' = Jira Server/Data Center (plain text)
 def jira_can_create():
-    return bool(JIRA_BASE_URL and JIRA_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY)
+    return bool(JIRA_BASE_URL and JIRA_BASE_URL.startswith('https://') and JIRA_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY)
+JIRA_SEMAPHORE=threading.Semaphore(int(os.getenv('MAX_CONCURRENT_JIRA_CALLS','3')))
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # The Basic-auth header must never follow a redirect to a different host — urllib's
+    # default handler would copy it there. Refusing the redirect outright is the safe choice.
+    def redirect_request(self,*a,**k):return None
+_JIRA_OPENER=urllib.request.build_opener(_NoRedirect)
 def jira_create_issue(summary:str,description_text:str):
     """Create a real issue in JIRA via its REST API. Raises HTTPException with
     JIRA's own error detail on failure — never silently pretends to succeed."""
     if not jira_can_create():
-        missing=[n for n,v in (('JIRA_BASE_URL',JIRA_BASE_URL),('JIRA_EMAIL',JIRA_EMAIL),('JIRA_API_TOKEN',JIRA_API_TOKEN),('JIRA_PROJECT_KEY',JIRA_PROJECT_KEY)) if not v]
-        raise HTTPException(400,f"JIRA ticket creation is not configured on the server. Missing: {', '.join(missing)}")
+        missing=[n for n,v in (('JIRA_BASE_URL (must be https://)',JIRA_BASE_URL.startswith('https://') if JIRA_BASE_URL else ''),('JIRA_EMAIL',JIRA_EMAIL),('JIRA_API_TOKEN',JIRA_API_TOKEN),('JIRA_PROJECT_KEY',JIRA_PROJECT_KEY)) if not v]
+        raise HTTPException(400,f"JIRA ticket creation is not configured on the server. Missing/invalid: {', '.join(missing)}")
     if JIRA_API_VERSION=='2':
         description=description_text
     else:
@@ -188,53 +208,98 @@ def jira_create_issue(summary:str,description_text:str):
     auth=base64.b64encode(f'{JIRA_EMAIL}:{JIRA_API_TOKEN}'.encode()).decode()
     req=urllib.request.Request(url,data=json.dumps(payload).encode(),method='POST',headers={
         'Authorization':f'Basic {auth}','Content-Type':'application/json','Accept':'application/json'})
+    if not JIRA_SEMAPHORE.acquire(timeout=10):
+        raise HTTPException(429,'Too many JIRA requests in flight — try again shortly')
     try:
-        with urllib.request.urlopen(req,timeout=15) as resp:
-            data=json.loads(resp.read().decode())
-            key=data.get('key')
-            if not key:raise HTTPException(502,'JIRA accepted the request but returned no ticket key')
-            return {'key':key,'url':f'{JIRA_BASE_URL}/browse/{key}'}
-    except urllib.error.HTTPError as e:
-        body=e.read().decode(errors='ignore')
         try:
-            parsed=json.loads(body)
-            msgs=parsed.get('errorMessages') or []
-            field_errs=parsed.get('errors') or {}
-            detail='; '.join(list(msgs)+[f'{k}: {v}' for k,v in field_errs.items()]) or body[:300]
-        except Exception:
-            detail=body[:300] or e.reason
-        raise HTTPException(502,f'JIRA rejected the request (HTTP {e.code}): {detail}')
-    except urllib.error.URLError as e:
-        raise HTTPException(502,f'Could not reach JIRA at {JIRA_BASE_URL}: {e.reason}')
-    except TimeoutError:
-        raise HTTPException(502,f'JIRA at {JIRA_BASE_URL} did not respond in time')
+            with _JIRA_OPENER.open(req,timeout=15) as resp:
+                try:data=json.loads(resp.read().decode())
+                except Exception:raise HTTPException(502,'JIRA returned a non-JSON success response — could not confirm the ticket key')
+                key=data.get('key')
+                if not key:raise HTTPException(502,'JIRA accepted the request but returned no ticket key')
+                return {'key':key,'url':f'{JIRA_BASE_URL}/browse/{key}'}
+        except urllib.error.HTTPError as e:
+            body=e.read().decode(errors='ignore')
+            try:
+                parsed=json.loads(body)
+                msgs=parsed.get('errorMessages') or []
+                field_errs=parsed.get('errors') or {}
+                detail='; '.join(list(msgs)+[f'{k}: {v}' for k,v in field_errs.items()]) or body[:300]
+            except Exception:
+                detail=body[:300] or e.reason
+            raise HTTPException(502,f'JIRA rejected the request (HTTP {e.code}): {detail}')
+        except urllib.error.URLError as e:
+            raise HTTPException(502,f'Could not reach JIRA at {JIRA_BASE_URL}: {e.reason}')
+        except TimeoutError:
+            raise HTTPException(502,f'JIRA at {JIRA_BASE_URL} did not respond in time')
+    finally:
+        JIRA_SEMAPHORE.release()
 FEEDBACK_STATUSES=('Open','In Progress','Fixed','By Design','Will Fix Later','Resolved','Validation','Closed','Regression')
-app=FastAPI(title='FeaturePulse API',version='1.0.0')
+app=FastAPI(title='FeaturePulse API',version='1.0.0',
+    docs_url='/docs' if ENABLE_DOCS else None,redoc_url='/redoc' if ENABLE_DOCS else None,
+    openapi_url='/openapi.json' if ENABLE_DOCS else None)
+# Defense-in-depth against DNS rebinding: a page on an attacker-controlled domain that
+# re-resolves to this server's IP still can't reach it, because the Host header won't match.
+# 'testserver' is Starlette/FastAPI's own TestClient host — kept so the app stays testable.
+app.add_middleware(TrustedHostMiddleware,allowed_hosts=os.getenv('ALLOWED_HOSTS','localhost,127.0.0.1,testserver').split(','))
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','),allow_methods=['*'],allow_headers=['*'])
 def db():
     with SessionLocal() as s: yield s
 def auth(authorization:Optional[str]=Header(None)):
-    if TOKEN and not secrets.compare_digest(authorization or '',f'Bearer {TOKEN}'):
-        raise HTTPException(401,'Invalid API token')
+    if not TOKEN:return  # only reachable at all when FP_ALLOW_NO_AUTH=1 was explicitly set
+    try:ok=secrets.compare_digest((authorization or '').encode(),f'Bearer {TOKEN}'.encode())
+    except Exception:ok=False  # non-UTF8 header bytes etc. — treat as invalid, never 500
+    if not ok:raise HTTPException(401,'Invalid API token')
+Severity=Literal['Low','Medium','High','Critical']
+ValidationResult=Literal['Pass','Fail','Blocked']
+QuestionKind=Literal['rating','text','yes_no']
+SuggestionAction=Literal['accept','merge','ignore']
+def _http_url_or_empty(v:str)->str:
+    v=(v or '').strip()
+    if v and not re.match(r'^https?://',v,re.I):raise ValueError('must be an http:// or https:// URL, or empty')
+    return v
+def _jira_ticket_or_empty(v:str)->str:
+    v=(v or '').strip()
+    if not v:return v
+    if re.match(r'^[A-Za-z][A-Za-z0-9_]*-\d+$',v):return v  # a ticket key like PROJ-123
+    if re.match(r'^https?://',v,re.I):return v  # a full URL — jiraTicketHref on the frontend only links it if the host matches JIRA_BASE_URL
+    raise ValueError('must be a ticket key like PROJ-123 or a full ticket URL')
 class AppIn(BaseModel): name:str=Field(min_length=1,max_length=120)
-class FeatureGroupIn(BaseModel): application_id:int; name:str=Field(min_length=1,max_length=160); description:str=''; source:str='Manual'
-class FeatureIn(BaseModel): application_id:int; name:str=Field(min_length=1,max_length=160); group_id:Optional[int]=None; reviewer:str=''
-class FeatureUpdateIn(BaseModel): name:Optional[str]=None; group_id:Optional[int]=None; reviewer:Optional[str]=None
-class FeedbackQuestionIn(BaseModel): feature_id:int; prompt:str=Field(min_length=1,max_length=300); kind:str='rating'; required:bool=False
+class FeatureGroupIn(BaseModel): application_id:int; name:str=Field(min_length=1,max_length=160); description:str=Field(default='',max_length=4000); source:str=Field(default='Manual',max_length=30)
+class FeatureIn(BaseModel): application_id:int; name:str=Field(min_length=1,max_length=160); group_id:Optional[int]=None; reviewer:str=Field(default='',max_length=160)
+class FeatureUpdateIn(BaseModel):
+    name:Optional[str]=Field(default=None,min_length=1,max_length=160)
+    group_id:Optional[int]=None; reviewer:Optional[str]=Field(default=None,max_length=160)
+class FeedbackQuestionIn(BaseModel): feature_id:int; prompt:str=Field(min_length=1,max_length=300); kind:QuestionKind='rating'; required:bool=False
 class ReleaseIn(BaseModel): application_id:int; version:str=Field(min_length=1,max_length=60)
 class FeedbackIn(BaseModel):
     feature_id:int; reported_release_id:int; title:str=Field(min_length=1,max_length=220)
-    description:str=''; source_url:str=Field(default='',max_length=2000); reporter:str=''; assignee:str=''; severity:str='Medium'; regression_required:bool=False
-class UpdateIn(BaseModel): status:Optional[str]=None; assignee:Optional[str]=None; regression_required:Optional[bool]=None; jira_ticket:Optional[str]=None
-class ValidationIn(BaseModel): feedback_id:int; release_id:int; result:str; tester:str; notes:str=''
-class RepositoryIn(BaseModel): application_id:int; url:str=Field(min_length=4,max_length=500); branch:str='main'
+    description:str=Field(default='',max_length=20000); source_url:str=Field(default='',max_length=2000)
+    reporter:str=Field(default='',max_length=120); assignee:str=Field(default='',max_length=120); severity:Severity='Medium'; regression_required:bool=False
+    _v_source_url=field_validator('source_url')(lambda cls,v:_http_url_or_empty(v))
+class UpdateIn(BaseModel):
+    status:Optional[str]=None; assignee:Optional[str]=Field(default=None,max_length=120); regression_required:Optional[bool]=None
+    jira_ticket:Optional[str]=Field(default=None,max_length=300)
+    _v_jira=field_validator('jira_ticket')(lambda cls,v:_jira_ticket_or_empty(v) if v is not None else v)
+class ValidationIn(BaseModel): feedback_id:int; release_id:int; result:ValidationResult; tester:str=Field(min_length=1,max_length=120); notes:str=Field(default='',max_length=5000)
+class RepositoryIn(BaseModel): application_id:int; url:str=Field(min_length=4,max_length=500); branch:str=Field(default='main',max_length=120)
 class ScanIn(BaseModel): release_id:Optional[int]=None
-class SuggestionActionIn(BaseModel): action:str; merge_feature_id:Optional[int]=None
+class SuggestionActionIn(BaseModel): action:SuggestionAction; merge_feature_id:Optional[int]=None
 class AssistantIn(BaseModel): application_id:int; message:str=Field(min_length=1,max_length=1000)
-class TestIn(BaseModel): feature_id:int; name:str=Field(min_length=1,max_length=200); target_url:str=Field(min_length=4,max_length=2000); steps:list=Field(default_factory=list)
-class TestUpdateIn(BaseModel): name:Optional[str]=None; target_url:Optional[str]=None; steps:Optional[list]=None
+class Step(BaseModel):
+    action:Literal['goto','wait','click','fill','waitFor','expectVisible','expectText','screenshot']
+    selector:Optional[str]=Field(default=None,max_length=500)
+    text:Optional[str]=Field(default=None,max_length=500)
+    value:Optional[str]=Field(default=None,max_length=2000)
+    url:Optional[str]=Field(default=None,max_length=2000)
+    name:Optional[str]=Field(default=None,max_length=120)
+    timeout:Optional[int]=Field(default=None,ge=0,le=60000)
+class TestIn(BaseModel): feature_id:int; name:str=Field(min_length=1,max_length=200); target_url:str=Field(min_length=4,max_length=2000); steps:list[Step]=Field(default_factory=list,max_length=200)
+class TestUpdateIn(BaseModel):
+    name:Optional[str]=Field(default=None,min_length=1,max_length=200)
+    target_url:Optional[str]=Field(default=None,min_length=4,max_length=2000); steps:Optional[list[Step]]=Field(default=None,max_length=200)
 class RunIn(BaseModel): release_id:Optional[int]=None
-class ImportIn(BaseModel): application_id:int; feature_id:Optional[int]=None; target_url:str=''; format:str='auto'; content:str=Field(min_length=1,max_length=200000)
+class ImportIn(BaseModel): application_id:int; feature_id:Optional[int]=None; target_url:str=Field(default='',max_length=2000); format:str='auto'; content:str=Field(min_length=1,max_length=200000)
 def asdict(x): return {c.name:getattr(x,c.name) for c in x.__table__.columns}
 def get_or_404(s,model,id):
     x=s.get(model,id)
@@ -274,12 +339,19 @@ def features(application_id:Optional[int]=None,s:Session=Depends(db)):
 @app.post('/features',dependencies=[Depends(auth)])
 def add_feature(v:FeatureIn,s:Session=Depends(db)):
     get_or_404(s,Application,v.application_id)
+    if v.group_id:
+        g=get_or_404(s,FeatureGroup,v.group_id)
+        if g.application_id!=v.application_id:raise HTTPException(400,'Feature group belongs to a different application')
     x=Feature(**v.model_dump());s.add(x);s.commit();s.refresh(x);return asdict(x)
 @app.patch('/features/{feature_id}',dependencies=[Depends(auth)])
 def update_feature(feature_id:int,v:FeatureUpdateIn,s:Session=Depends(db)):
     x=get_or_404(s,Feature,feature_id)
     if v.name is not None:x.name=v.name
-    if v.group_id is not None:x.group_id=v.group_id or None
+    if v.group_id is not None:
+        if v.group_id:
+            g=get_or_404(s,FeatureGroup,v.group_id)
+            if g.application_id!=x.application_id:raise HTTPException(400,'Feature group belongs to a different application')
+        x.group_id=v.group_id or None
     if v.reviewer is not None:x.reviewer=v.reviewer
     s.commit();s.refresh(x);return asdict(x)
 @app.get('/releases',dependencies=[Depends(auth)])
@@ -324,32 +396,52 @@ def update_feedback(feedback_id:int,v:UpdateIn,s:Session=Depends(db)):
     if v.assignee is not None:x.assignee=v.assignee
     if v.regression_required is not None:x.regression_required=v.regression_required
     s.commit();return feedback_out(s,x)
+def _magic_matches(content_type:str,head:bytes)->bool:
+    # Never trust the client-supplied Content-Type alone — check the file's actual magic
+    # bytes match what it claims to be, so arbitrary content can't be stored/served under
+    # a false, trusted-looking type.
+    if content_type=='image/png':return head.startswith(b'\x89PNG\r\n\x1a\n')
+    if content_type=='image/jpeg':return head.startswith(b'\xff\xd8\xff')
+    if content_type=='image/webp':return head[:4]==b'RIFF' and head[8:12]==b'WEBP'
+    if content_type=='video/webm':return head.startswith(b'\x1a\x45\xdf\xa3')
+    if content_type=='video/mp4':return head[4:8]==b'ftyp'
+    return False
 @app.post('/feedback/{feedback_id}/evidence',dependencies=[Depends(auth)])
 async def upload(feedback_id:int,file:UploadFile=File(...),s:Session=Depends(db)):
     get_or_404(s,Feedback,feedback_id)
-    allowed={'image/png','.jpg','image/jpeg','image/webp','video/webm','video/mp4'}
+    allowed={'image/png','image/jpeg','image/webp','video/webm','video/mp4'}
     if file.content_type not in allowed:raise HTTPException(415,'Only PNG/JPEG/WebP/WebM/MP4 accepted')
     suffix={ 'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','video/webm':'.webm','video/mp4':'.mp4'}[file.content_type]
-    name=f'{uuid.uuid4().hex}{suffix}';dest=STORAGE/name;total=0
+    name=f'{uuid.uuid4().hex}{suffix}';dest=STORAGE/name;total=0;first=True
     try:
         with dest.open('wb') as out:
             while chunk:=await file.read(1024*1024):
+                if first:
+                    if not _magic_matches(file.content_type,chunk[:16]):
+                        raise HTTPException(415,"File content doesn't match its declared type")
+                    first=False
                 total+=len(chunk)
                 if total>MAX_UPLOAD:raise HTTPException(413,'File exceeds 50 MB')
                 out.write(chunk)
+        if first:raise HTTPException(400,'Empty file')  # loop never ran — zero-byte upload
     except Exception:
         dest.unlink(missing_ok=True);raise
     e=Evidence(feedback_id=feedback_id,stored_name=name,original_name=(file.filename or 'attachment')[:255],mime_type=file.content_type)
     s.add(e);s.commit();s.refresh(e);return {'id':e.id,'name':e.original_name}
 @app.get('/evidence/{evidence_id}',dependencies=[Depends(auth)])
 def download(evidence_id:int,s:Session=Depends(db)):
-    e=get_or_404(s,Evidence,evidence_id);return FileResponse(STORAGE/e.stored_name,media_type=e.mime_type,filename=e.original_name)
+    e=get_or_404(s,Evidence,evidence_id);path=STORAGE/e.stored_name
+    if not path.is_file():raise HTTPException(404,'Evidence file is missing from storage')
+    return FileResponse(path,media_type=e.mime_type,filename=e.original_name,headers={'X-Content-Type-Options':'nosniff'})
 @app.get('/regression',dependencies=[Depends(auth)])
 def regression(release_id:Optional[int]=None,s:Session=Depends(db)):
     q=select(Feedback).where(Feedback.regression_required==True)
     if release_id:
         rel=get_or_404(s,Release,release_id)
-        q=q.join(Feature).where(Feature.application_id==rel.application_id,Feedback.reported_release_id<=rel.id)
+        # Ordered by when the release was actually created, not its auto-increment id —
+        # a hotfix release made after a later one would otherwise be treated as "earlier".
+        q=q.join(Feature).join(Release,Feedback.reported_release_id==Release.id).where(
+            Feature.application_id==rel.application_id,Release.created_at<=rel.created_at)
     result=[]
     for f in s.scalars(q.order_by(Feedback.id.desc())):
         d=feedback_out(s,f)
@@ -386,16 +478,23 @@ def humanize(v:str):
     return v[:1].upper()+v[1:] if v else v
 def discover_features(root:Path):
     found={}
+    root_resolved=root.resolve()
+    scanned=0
     def add(name,cat,evidence,score):
         name=humanize(name)
         if len(name)<3 or name.lower() in STOP or name.lower().endswith(('test','spec')):return
         key=name.lower()
         if key not in found or score>found[key]['confidence']:found[key]={'name':name[:160],'category':humanize(cat or 'General')[:120],'evidence':evidence[:800],'confidence':min(score,95)}
     for path in root.rglob('*'):
+        if path.is_symlink():continue  # never follow a symlink out of the clone (e.g. -> /etc/passwd)
         if not path.is_file() or any(x in IGNORE_DIRS for x in path.parts) or path.suffix.lower() not in TEXT_EXT:continue
         try:
+            resolved=path.resolve(strict=True)
+            if not resolved.is_relative_to(root_resolved):continue  # defense-in-depth vs. the symlink check above
             rel=path.relative_to(root);size=path.stat().st_size
             if size>600_000:continue
+            scanned+=1
+            if scanned>5000:break  # cap work on an unexpectedly huge repository
             text=path.read_text(errors='ignore')
         except Exception:continue
         parts=list(rel.parts); low=[x.lower() for x in parts]
@@ -418,26 +517,59 @@ def discover_features(root:Path):
             if stem.lower() not in STOP:add(stem,parts[-2] if len(parts)>1 else 'UI',f'UI component: {rel}',62)
     return sorted(found.values(),key=lambda x:(-x['confidence'],x['name']))[:100]
 
+GIT_ENV={k:os.environ[k] for k in ('PATH','HOME') if k in os.environ}|{
+    'GIT_TERMINAL_PROMPT':'0','GIT_ASKPASS':'/bin/false','LANG':'C.UTF-8'}
+# git never sees JIRA_API_TOKEN/API_TOKEN/DATABASE_URL — same isolation as the test runner.
 def clone_repo(repo:Repository):
+    if not re.match(r'^[\w./-]+$',repo.branch) or repo.branch.startswith('-'):
+        raise HTTPException(400,'Invalid branch name')
     tmp=Path(tempfile.mkdtemp(prefix='featurepulse-repo-'))
     try:
-        cmd=['git','clone','--depth','1','--branch',repo.branch,repo.url,str(tmp/'repo')]
-        r=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
-        if r.returncode!=0:raise HTTPException(400,'Git clone failed. Check repository URL, branch, and server-side Git credentials. '+r.stderr[-300:])
-        commit=subprocess.run(['git','-C',str(tmp/'repo'),'rev-parse','HEAD'],capture_output=True,text=True,timeout=10).stdout.strip()
+        cmd=['git','-c','core.symlinks=false','clone','--depth','1','--single-branch','--no-tags',
+             '--branch',repo.branch,'--',repo.url,str(tmp/'repo')]
+        r=subprocess.run(cmd,capture_output=True,text=True,timeout=90,env=GIT_ENV)
+        if r.returncode!=0:
+            print(f'[git clone failed] repo={repo.id} stderr={r.stderr[-500:]}')  # server-side only — never echoed to the client
+            raise HTTPException(400,'Git clone failed. Check the repository URL and branch.')
+        commit=subprocess.run(['git','-C',str(tmp/'repo'),'rev-parse','HEAD'],capture_output=True,text=True,timeout=10,env=GIT_ENV).stdout.strip()
         return tmp,tmp/'repo',commit
     except subprocess.TimeoutExpired:
         shutil.rmtree(tmp,ignore_errors=True);raise HTTPException(408,'Repository clone timed out')
+    except BaseException:
+        shutil.rmtree(tmp,ignore_errors=True);raise
 
 @app.get('/repositories',dependencies=[Depends(auth)])
 def repositories(application_id:Optional[int]=None,s:Session=Depends(db)):
     q=select(Repository)
     if application_id:q=q.where(Repository.application_id==application_id)
     return [asdict(x) for x in s.scalars(q.order_by(Repository.id.desc()))]
+def check_repo_url_not_internal(url:str):
+    """Best-effort SSRF guard: reject obviously-internal clone targets (loopback,
+    private/link-local ranges incl. the 169.254.169.254 cloud-metadata address, and
+    literal 'localhost'). This resolves DNS at check time, so it cannot fully defend
+    against DNS rebinding (a hostname resolving differently between this check and the
+    later `git clone`) — it stops naive/accidental internal targeting, not a determined
+    attacker controlling DNS. A real deployment scanning untrusted URLs should clone
+    through an egress proxy or network policy instead of relying on this alone."""
+    if url.startswith('git@'):return  # SSH targets aren't resolved/validated here
+    host=(urlparse(url).hostname or '').lower()
+    if not host:raise HTTPException(400,'Could not parse a hostname from the repository URL')
+    if host=='localhost' or host.endswith('.local'):raise HTTPException(400,'Repository host is not allowed (internal/loopback target)')
+    try:
+        import socket,ipaddress
+        infos=socket.getaddrinfo(host,None)
+        addrs=[ipaddress.ip_address(i[4][0]) for i in infos]
+        if addrs and all(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast for a in addrs):
+            raise HTTPException(400,'Repository host resolves to an internal/private address and is not allowed')
+    except HTTPException:raise
+    except Exception:pass  # DNS failure etc. — let the clone itself fail naturally
 @app.post('/repositories',dependencies=[Depends(auth)])
 def add_repository(v:RepositoryIn,s:Session=Depends(db)):
     get_or_404(s,Application,v.application_id)
     if not (v.url.startswith('https://') or v.url.startswith('http://') or v.url.startswith('git@')):raise HTTPException(400,'Use an HTTP(S) or SSH Git repository URL')
+    if (v.url.startswith('http://') or v.url.startswith('https://')) and urlparse(v.url).username:
+        raise HTTPException(400,'Do not embed credentials in the repository URL — they would be stored in plain text and shown to every user')
+    check_repo_url_not_internal(v.url)
     x=Repository(**v.model_dump());s.add(x);s.commit();s.refresh(x);return asdict(x)
 
 @app.post('/demo/git-discovery',dependencies=[Depends(auth)])
@@ -465,15 +597,22 @@ def seed_git_discovery_demo(s:Session=Depends(db)):
     s.commit()
     return {'application_id':app_record.id,'release_id':release.id,'message':'Demo data loaded. No GitHub repository was contacted.'}
 
+SCAN_SEMAPHORE=threading.Semaphore(int(os.getenv('MAX_CONCURRENT_SCANS','2')))
 @app.post('/repositories/{repository_id}/scan',dependencies=[Depends(auth)])
 def scan_repository(repository_id:int,v:ScanIn,s:Session=Depends(db)):
     repo=get_or_404(s,Repository,repository_id)
     if v.release_id:
         rel=get_or_404(s,Release,v.release_id)
         if rel.application_id!=repo.application_id:raise HTTPException(400,'Release belongs to a different application')
-    tmp,root,commit=clone_repo(repo)
-    try: items=discover_features(root)
-    finally: shutil.rmtree(tmp,ignore_errors=True)
+    check_repo_url_not_internal(repo.url)  # re-check: DNS may have changed since the repo was added
+    if not SCAN_SEMAPHORE.acquire(timeout=5):
+        raise HTTPException(429,'Too many repository scans running — try again shortly')
+    try:
+        tmp,root,commit=clone_repo(repo)
+        try: items=discover_features(root)
+        finally: shutil.rmtree(tmp,ignore_errors=True)
+    finally:
+        SCAN_SEMAPHORE.release()
     existing={x.name.lower() for x in s.scalars(select(Feature).where(Feature.application_id==repo.application_id))}
     # Replace only pending suggestions for this repository, preserving review history.
     for old in s.scalars(select(FeatureSuggestion).where(FeatureSuggestion.repository_id==repo.id,FeatureSuggestion.status=='Pending')):s.delete(old)
@@ -530,14 +669,23 @@ def feature_assistant(v:AssistantIn,s:Session=Depends(db)):
 # --- Authored E2E UI testing ---
 RUNNER=Path(__file__).resolve().parent.parent/'runner'/'run_test.mjs'
 TESTRUN_DIR=STORAGE/'testruns'; TESTRUN_DIR.mkdir(parents=True,exist_ok=True)
-VALID_ACTIONS={'goto','wait','waitFor','click','fill','expectVisible','expectText','screenshot'}
 def node_bin():
     return shutil.which('node') or next((p for p in ('/usr/local/bin/node','/opt/homebrew/bin/node','/usr/bin/node') if Path(p).exists()),None)
 def clean_steps(raw):
+    """Accepts already-validated Step instances (from TestIn/TestUpdateIn, where FastAPI
+    validated them) or raw dicts (from the JSON/text import parsers, which build plain
+    dicts by hand). Either way, every step is validated through the Step model and
+    capped at 200 steps, so a bad `timeout`, an unknown `action`, or an oversized
+    `selector` is rejected the same way regardless of which path it came from."""
+    raw=raw or []
+    if len(raw)>200:raise HTTPException(400,'A test may have at most 200 steps')
     out=[]
-    for st in (raw or []):
-        if not isinstance(st,dict) or st.get('action') not in VALID_ACTIONS:raise HTTPException(400,f'Invalid step: {st}')
-        out.append({k:v for k,v in st.items() if k in ('action','selector','text','value','url','name','timeout')})
+    for st in raw:
+        if isinstance(st,Step):out.append(st.model_dump(exclude_none=True))
+        elif isinstance(st,dict):
+            try:out.append(Step(**st).model_dump(exclude_none=True))
+            except Exception as e:raise HTTPException(400,f'Invalid step {st}: {e}')
+        else:raise HTTPException(400,f'Invalid step: {st}')
     return out
 def test_out(s,x):
     d=asdict(x); d['steps']=json.loads(x.steps or '[]')
@@ -557,8 +705,10 @@ def egress_policy():
 def jira_integration():
     return {'configured':bool(JIRA_BASE_URL),'can_create':jira_can_create(),'base_url':JIRA_BASE_URL,'project_key':JIRA_PROJECT_KEY,'issue_type':JIRA_ISSUE_TYPE}
 @app.post('/feedback/{feedback_id}/jira-ticket',dependencies=[Depends(auth)])
-def create_jira_ticket(feedback_id:int,s:Session=Depends(db)):
+def create_jira_ticket(feedback_id:int,force:bool=False,s:Session=Depends(db)):
     x=get_or_404(s,Feedback,feedback_id)
+    if x.jira_ticket and not force:
+        raise HTTPException(409,f'Feedback #{x.id} is already linked to {x.jira_ticket} — pass force=true to create a second ticket anyway')
     feature=s.get(Feature,x.feature_id);release=s.get(Release,x.reported_release_id)
     lines=[
         f'Feature: {feature.name if feature else "-"}',
@@ -599,7 +749,9 @@ def update_test(test_id:int,v:TestUpdateIn,s:Session=Depends(db)):
 @app.delete('/tests/{test_id}',dependencies=[Depends(auth)])
 def delete_test(test_id:int,s:Session=Depends(db)):
     x=get_or_404(s,Test,test_id)
-    for r in s.scalars(select(TestRun).where(TestRun.test_id==test_id)):s.delete(r)
+    for r in s.scalars(select(TestRun).where(TestRun.test_id==test_id)):
+        shutil.rmtree(TESTRUN_DIR/str(r.id),ignore_errors=True)  # screenshots etc. — don't orphan them on disk
+        s.delete(r)
     s.delete(x);s.commit();return {'deleted':test_id}
 @app.post('/tests/{test_id}/run',dependencies=[Depends(auth)])
 def run_test(test_id:int,v:RunIn,s:Session=Depends(db)):
@@ -616,13 +768,21 @@ def run_test(test_id:int,v:RunIn,s:Session=Depends(db)):
     cp=os.getenv('CHROME_PATH')
     if cp:spec['chrome_path']=cp
     spec_path=out_dir/'spec.json';spec_path.write_text(json.dumps(spec))
+    # The runner (and the Chrome it drives) must never see backend secrets — pass only
+    # what's needed to find Node/Chrome, not the full parent environment (API_TOKEN,
+    # JIRA_API_TOKEN, DATABASE_URL, etc.). A compromised/misdirected test step that reads
+    # local files (blocked separately by host_allowed's scheme check) must find nothing here.
+    runner_env={k:os.environ[k] for k in ('PATH','HOME','TMPDIR','LANG','CHROME_NO_SANDBOX') if k in os.environ}
     try:
-        proc=subprocess.run([node,str(RUNNER),str(spec_path)],capture_output=True,text=True,timeout=180)
-        data=json.loads(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else {'status':'Error','error':(proc.stderr or 'no output')[-500:]}
-    except subprocess.TimeoutExpired:
-        data={'status':'Error','error':'Test run timed out after 180s','steps':[],'screenshots':[],'console_errors':[]}
-    except Exception as e:
-        data={'status':'Error','error':str(e),'steps':[],'screenshots':[],'console_errors':[]}
+        try:
+            proc=subprocess.run([node,str(RUNNER),str(spec_path)],capture_output=True,text=True,timeout=180,env=runner_env)
+            data=json.loads(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else {'status':'Error','error':(proc.stderr or 'no output')[-500:]}
+        except subprocess.TimeoutExpired:
+            data={'status':'Error','error':'Test run timed out after 180s','steps':[],'screenshots':[],'console_errors':[]}
+        except Exception as e:
+            data={'status':'Error','error':str(e),'steps':[],'screenshots':[],'console_errors':[]}
+    finally:
+        spec_path.unlink(missing_ok=True)  # spec.json holds any plaintext `fill` values from the test's steps
     run.status=data.get('status','Error');run.duration_ms=data.get('duration_ms',0)
     run.steps_log=json.dumps(data.get('steps',[]));run.screenshots=json.dumps(data.get('screenshots',[]))
     run.console_errors=json.dumps(data.get('console_errors',[]));run.error=data.get('error') or ''
@@ -635,20 +795,25 @@ def list_runs(test_id:Optional[int]=None,application_id:Optional[int]=None,s:Ses
     return [run_out(x) for x in s.scalars(q.order_by(TestRun.id.desc()).limit(100))]
 @app.get('/test-runs/{run_id}/artifact/{name}',dependencies=[Depends(auth)])
 def run_artifact(run_id:int,name:str,s:Session=Depends(db)):
-    get_or_404(s,TestRun,run_id)
-    if '/' in name or '\\' in name or '..' in name:raise HTTPException(400,'Invalid name')
+    run=get_or_404(s,TestRun,run_id)
+    # Only ever serve a filename the runner itself recorded as a screenshot for this run —
+    # never an arbitrary name (which would otherwise let someone fetch spec.json, etc.).
+    if name not in json.loads(run.screenshots or '[]'):raise HTTPException(404,'Artifact not found')
     p=TESTRUN_DIR/str(run_id)/name
-    if not p.exists():raise HTTPException(404,'Artifact not found')
-    return FileResponse(p,media_type='image/png')
+    if not p.is_file():raise HTTPException(404,'Artifact not found')
+    return FileResponse(p,media_type='image/png',headers={'X-Content-Type-Options':'nosniff'})
 def parse_text_tests(content:str,default_url:str):
     """Parse a simple line-based test-case format into test dicts.
     `test: <name>` starts a test, `url: <url>` sets its target, other lines are steps:
     goto <url> | wait <ms> | click <sel> | waitFor <sel> [~ text] | expectVisible <sel>
-    expectText [<sel> ~] <text> | fill <sel> = <value> | screenshot <name>"""
-    tests=[];cur=None
+    expectText [<sel> ~] <text> | fill <sel> = <value> | screenshot <name>
+    Any line that isn't one of the above, or a `fill` without `=`, is collected into
+    `problems` (1-indexed line numbers) instead of being silently dropped — a typo that
+    quietly loses a step would otherwise produce a false-green test."""
+    tests=[];cur=None;problems=[]
     def flush():
         if cur and cur['steps']:tests.append(cur)
-    for line in content.splitlines():
+    for i,line in enumerate(content.splitlines(),1):
         line=line.strip()
         if not line or line.startswith('#'):continue
         low=line.lower()
@@ -659,7 +824,7 @@ def parse_text_tests(content:str,default_url:str):
         parts=line.split(None,1);action=parts[0];rest=parts[1].strip() if len(parts)>1 else ''
         amap={'goto':'goto','wait':'wait','click':'click','waitfor':'waitFor','expectvisible':'expectVisible','expecttext':'expectText','fill':'fill','screenshot':'screenshot'}
         act=amap.get(action.lower())
-        if not act:continue
+        if not act:problems.append(f'line {i}: unrecognized step "{line}"');continue
         if act=='goto':cur['steps'].append({'action':'goto','url':rest})
         elif act=='wait':cur['steps'].append({'action':'wait','timeout':int(re.sub(r'\D','',rest) or '1000')})
         elif act=='screenshot':cur['steps'].append({'action':'screenshot','name':rest or 'shot'})
@@ -669,10 +834,11 @@ def parse_text_tests(content:str,default_url:str):
             else:cur['steps'].append({'action':'waitFor','selector':rest})
         elif act=='fill':
             if '=' in rest:sel,val=rest.split('=',1);cur['steps'].append({'action':'fill','selector':sel.strip(),'value':val.strip()})
+            else:problems.append(f'line {i}: "fill" needs a selector and a value, e.g. "fill #email = you@x.com" — got "{line}"')
         elif act=='expectText':
             if '~' in rest:sel,txt=rest.split('~',1);cur['steps'].append({'action':'expectText','selector':sel.strip(),'text':txt.strip()})
             else:cur['steps'].append({'action':'expectText','text':rest})
-    flush();return tests
+    flush();return tests,problems
 @app.post('/tests/import',dependencies=[Depends(auth)])
 def import_tests(v:ImportIn,s:Session=Depends(db)):
     get_or_404(s,Application,v.application_id)
@@ -682,16 +848,25 @@ def import_tests(v:ImportIn,s:Session=Depends(db)):
     if fmt=='json':
         try:parsed=json.loads(text)
         except Exception as e:raise HTTPException(400,f'Invalid JSON: {e}')
-        for t in (parsed if isinstance(parsed,list) else [parsed]):
-            raw.append({'name':t.get('name') or 'Imported test','target_url':t.get('target_url') or v.target_url,'steps':t.get('steps') or [],'feature_id':t.get('feature_id')})
+        items=parsed if isinstance(parsed,list) else [parsed]
+        for i,t in enumerate(items):
+            if not isinstance(t,dict):raise HTTPException(400,f'Test #{i+1} must be a JSON object, got {type(t).__name__}')
+            name=t.get('name');target_url=t.get('target_url') or v.target_url
+            if name is not None and not isinstance(name,str):raise HTTPException(400,f'Test #{i+1}: "name" must be a string')
+            if target_url is not None and not isinstance(target_url,str):raise HTTPException(400,f'Test #{i+1}: "target_url" must be a string')
+            if not isinstance(t.get('steps') or [],list):raise HTTPException(400,f'Test #{i+1}: "steps" must be a list')
+            raw.append({'name':name or 'Imported test','target_url':target_url or '','steps':t.get('steps') or [],'feature_id':t.get('feature_id')})
     else:
-        for t in parse_text_tests(text,v.target_url):raw.append({**t,'feature_id':None})
+        parsed_tests,problems=parse_text_tests(text,v.target_url)
+        if problems:raise HTTPException(400,'Could not parse: '+'; '.join(problems[:10])+(f' (+{len(problems)-10} more)' if len(problems)>10 else ''))
+        for t in parsed_tests:raw.append({**t,'feature_id':None})
     if not raw:raise HTTPException(400,'No test cases could be parsed')
     created=[]
     for t in raw:
         fid=t.get('feature_id') or v.feature_id
         if not fid:raise HTTPException(400,'A feature must be selected (or provided per test) to import into')
-        get_or_404(s,Feature,fid)
+        feat=get_or_404(s,Feature,fid)
+        if feat.application_id!=v.application_id:raise HTTPException(400,f"Feature {fid} does not belong to the selected application")
         if not (t['target_url'] or '').strip():raise HTTPException(400,f"Test '{t['name']}' has no target URL")
         t_steps=clean_steps(t['steps']);check_test_urls(t['target_url'],t_steps)
         x=Test(feature_id=fid,name=t['name'][:200],target_url=t['target_url'][:2000],steps=json.dumps(t_steps))

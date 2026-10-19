@@ -11,23 +11,49 @@ services:
       test: ["CMD-SHELL", "pg_isready -U featurepulse"]
       interval: 5s
       retries: 10
+    security_opt: ["no-new-privileges:true"]
   backend:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://featurepulse:${POSTGRES_PASSWORD}@db:5432/featurepulse
       STORAGE_DIR: /app/uploads
-      API_TOKEN: ${API_TOKEN:-}
+      # Required (no insecure default) — a compose deployment is reachable beyond one
+      # developer's own machine, unlike `uvicorn --reload` run directly for local dev.
+      API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env — required for docker compose, since this exposes the API beyond localhost}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${PORT:-8080}}
+      # These used to be listed in .env.example but never actually reached the container —
+      # an operator who set them believed they were in effect when they weren't.
+      ALLOWED_TEST_HOSTS: ${ALLOWED_TEST_HOSTS:-}
+      JIRA_BASE_URL: ${JIRA_BASE_URL:-}
+      JIRA_EMAIL: ${JIRA_EMAIL:-}
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+      JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+      JIRA_ISSUE_TYPE: ${JIRA_ISSUE_TYPE:-Bug}
+      JIRA_API_VERSION: ${JIRA_API_VERSION:-3}
     volumes:
       - evidence:/app/uploads
     depends_on:
       db:
         condition: service_healthy
+    # no cap_drop here: Chromium (even with --no-sandbox) can need capabilities beyond the
+    # Docker default depending on the host kernel, and that combination isn't verified in
+    # this change — dropping them blind risked silently breaking the test runner in
+    # containers. Revisit once that's actually been run and observed.
+    security_opt: ["no-new-privileges:true"]
   frontend:
     build: ./frontend
     ports:
-      - "${PORT:-8080}:80"
+      # Bound to localhost by default — a compose stack isn't meant to be reachable from
+      # the LAN out of the box. Override explicitly (e.g. "0.0.0.0:${PORT:-8080}:8080") only
+      # once you've put a reverse proxy / TLS / network policy in front of it.
+      - "127.0.0.1:${PORT:-8080}:8080"
     depends_on:
       - backend
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/var/cache/nginx", "/var/run", "/tmp"]
 volumes:
   pgdata:
   evidence:
