@@ -1,5 +1,11 @@
 # FeaturePulse
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![Node 20+](https://img.shields.io/badge/node-20%2B-339933)
+![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688)
+![React 19](https://img.shields.io/badge/frontend-React%2019-61DAFB)
+
 A product quality hub for teams building internally hosted web applications.
 It gives you one place to catalog an app's features, capture structured
 feedback against them per release, verify them with automated UI tests and a
